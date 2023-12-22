@@ -1,7 +1,7 @@
 synology-tun
 ============
 
-This small Docker image allows you install the tun kernel module on Synology
+This small Docker image allows you to load the tun kernel module on Synology
 hosts without having to set up manual scripts or scheduled tasks.
 
 You can use this in docker compose to have a service that depends on the tun
