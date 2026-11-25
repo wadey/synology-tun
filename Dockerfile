@@ -7,4 +7,4 @@ ARG BASE_IMAGE=busybox:latest
 
 FROM ${BASE_IMAGE}
 
-CMD ["/bin/sh", "-c", "grep '^tun ' /proc/modules || insmod /lib/modules/tun.ko"]
+CMD ["/bin/sh", "-c", "grep '^tun ' \"${PROC_MODULES:-/proc/modules}\" || insmod /lib/modules/tun.ko"]

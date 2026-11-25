@@ -112,7 +112,16 @@ jobs:
           fi
 
           TEST_DIR=$(mktemp -d)
-          trap 'rm -rf "$TEST_DIR"' EXIT
+          FIXTURE_DIR=$(mktemp -d)
+          EMPTY_MODS_DIR=$(mktemp -d)
+          LOADED_MOD=""
+          cleanup() {
+            if [ -n "$LOADED_MOD" ]; then
+              sudo rmmod "$LOADED_MOD" 2>/dev/null || true
+            fi
+            rm -rf "$TEST_DIR" "$FIXTURE_DIR" "$EMPTY_MODS_DIR"
+          }
+          trap cleanup EXIT
 
           echo "=== Test 1: missing tun.ko ==="
           set +e
@@ -150,6 +159,95 @@ jobs:
           fi
           if ! grep -qi "insmod:.*invalid module format" <<< "$OUTPUT"; then
             echo "ERROR: Expected insmod 'invalid module format' error" >&2
+            exit 1
+          fi
+
+          echo "=== Test 3: real kernel module load ==="
+          MOD_REL=""
+          MOD_NAME=""
+          for candidate in dummy ifb nlmon crc-itu-t crc7 cast-common twofish-common; do
+            proc_name="${candidate//-/_}"
+            if grep -q "^${proc_name} " /proc/modules; then
+              continue
+            fi
+            match=$(awk -v c="$candidate" '
+              NF == 1 && sub(/:$/, "", $1) {
+                f = $1
+                sub(/^.*\//, "", f)
+                if (f == c ".ko" || f == c ".ko.zst" || f == c ".ko.xz" || f == c ".ko.gz") {
+                  print $1
+                  exit
+                }
+              }
+            ' "/lib/modules/$(uname -r)/modules.dep" 2>/dev/null || true)
+            if [ -n "$match" ]; then
+              MOD_REL="$match"
+              MOD_NAME="$proc_name"
+              break
+            fi
+          done
+
+          if [ -z "$MOD_REL" ]; then
+            echo "ERROR: Could not find a harmless unloaded zero-dependency module in /lib/modules/$(uname -r)/modules.dep" >&2
+            exit 1
+          fi
+
+          MOD_SRC="/lib/modules/$(uname -r)/${MOD_REL}"
+          echo "Using runner module: ${MOD_SRC} (${MOD_NAME})"
+          case "$MOD_SRC" in
+            *.ko.zst) zstd -d -c "$MOD_SRC" > "${TEST_DIR}/tun.ko" ;;
+            *.ko.xz)  xz -d -c "$MOD_SRC" > "${TEST_DIR}/tun.ko" ;;
+            *.ko.gz)  gzip -d -c "$MOD_SRC" > "${TEST_DIR}/tun.ko" ;;
+            *.ko)     cp "$MOD_SRC" "${TEST_DIR}/tun.ko" ;;
+            *)
+              echo "ERROR: Unsupported module format: ${MOD_SRC}" >&2
+              exit 1
+              ;;
+          esac
+
+          docker run --rm --cap-add CAP_SYS_MODULE --network none \
+            -v "${TEST_DIR}:/lib/modules:ro" \
+            synology-tun:test
+          LOADED_MOD="$MOD_NAME"
+
+          if ! grep -q "^${MOD_NAME} " /proc/modules; then
+            echo "ERROR: Module '${MOD_NAME}' not found in /proc/modules after insmod" >&2
+            exit 1
+          fi
+          echo "Verified '${MOD_NAME}' loaded into /proc/modules"
+          sudo rmmod "$MOD_NAME"
+          LOADED_MOD=""
+
+          echo "=== Test 4: already-loaded short-circuit (PROC_MODULES) ==="
+          printf 'ext4 786432 1 - Live 0xffffffffc0456000\ntun 57344 0 - Live 0xffffffffc0123000\n' > "${FIXTURE_DIR}/loaded"
+          OUTPUT=$(docker run --rm --network none \
+            -e PROC_MODULES=/fixtures/loaded \
+            -v "${FIXTURE_DIR}:/fixtures:ro" \
+            -v "${EMPTY_MODS_DIR}:/lib/modules:ro" \
+            synology-tun:test 2>&1)
+          echo "4a output: ${OUTPUT}"
+          if ! grep -q '^tun ' <<< "$OUTPUT"; then
+            echo "ERROR: Expected matching 'tun ' line in output" >&2
+            exit 1
+          fi
+
+          printf 'tunnel4 16384 0 - Live 0xffffffffc0123000\n' > "${FIXTURE_DIR}/prefix_mismatch"
+          set +e
+          OUTPUT=$(docker run --rm --network none \
+            -e PROC_MODULES=/fixtures/prefix_mismatch \
+            -v "${FIXTURE_DIR}:/fixtures:ro" \
+            -v "${EMPTY_MODS_DIR}:/lib/modules:ro" \
+            synology-tun:test 2>&1)
+          STATUS=$?
+          set -e
+          echo "4b exit status: ${STATUS}"
+          echo "4b output: ${OUTPUT}"
+          if [ "$STATUS" -eq 0 ]; then
+            echo "ERROR: Expected non-zero exit status when only 'tunnel4' is present" >&2
+            exit 1
+          fi
+          if ! grep -qi "insmod:.*No such file or directory" <<< "$OUTPUT"; then
+            echo "ERROR: Expected insmod 'No such file or directory' error on prefix mismatch" >&2
             exit 1
           fi
 
