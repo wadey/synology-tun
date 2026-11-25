@@ -1,0 +1,128 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  schedule:
+    # Run nightly at 03:23 UTC
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: wadey/synology-tun
+  BASE_IMAGE_REPO: docker.io/library/alpine
+  BASE_IMAGE_TAG: "3"
+
+jobs:
+  check:
+    name: Check for updates
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      should_build: ${{ steps.compare.outputs.should_build }}
+      base_digest: ${{ steps.compare.outputs.base_digest }}
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'schedule'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check base image digest
+        id: compare
+        run: |
+          set -euo pipefail
+
+          # Resolve the multi-arch manifest list digest of the upstream base image
+          MANIFEST_TMP=$(mktemp)
+          skopeo inspect --raw "docker://${BASE_IMAGE_REPO}:${BASE_IMAGE_TAG}" > "$MANIFEST_TMP"
+          UPSTREAM_BASE_DIGEST="sha256:$(sha256sum "$MANIFEST_TMP" | awk '{print $1}')"
+          rm -f "$MANIFEST_TMP"
+          echo "Upstream ${BASE_IMAGE_REPO}:${BASE_IMAGE_TAG} index digest: ${UPSTREAM_BASE_DIGEST}"
+          echo "base_digest=${UPSTREAM_BASE_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          NEEDS_BUILD=false
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Event is '${{ github.event_name }}'; forcing build."
+            NEEDS_BUILD=true
+          else
+            for ARCH in amd64 arm64; do
+              INSPECT_JSON=$(skopeo inspect --override-os linux --override-arch "${ARCH}" \
+                --authfile "${HOME}/.docker/config.json" \
+                "docker://${REGISTRY}/${IMAGE_NAME}:latest" 2>/dev/null || echo "{}")
+
+              BUILT_BASE=$(jq -r '.Labels["org.opencontainers.image.base.digest"] // ""' <<< "$INSPECT_JSON")
+              echo "[${ARCH}] built base: ${BUILT_BASE:-<none>}"
+
+              if [ "$UPSTREAM_BASE_DIGEST" != "$BUILT_BASE" ]; then
+                echo "-> [${ARCH}] Base image digest changed or arch missing."
+                NEEDS_BUILD=true
+              fi
+            done
+
+            if [ "$NEEDS_BUILD" = "false" ]; then
+              echo "Up to date on all architectures; skipping build."
+            fi
+          fi
+
+          echo "should_build=${NEEDS_BUILD}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and push image
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.base.name=${{ env.BASE_IMAGE_REPO }}:${{ env.BASE_IMAGE_TAG }}
+            org.opencontainers.image.base.digest=${{ needs.check.outputs.base_digest }}
+          annotations: ${{ github.event_name != 'pull_request' && format('index:org.opencontainers.image.source=https://github.com/{0}', github.repository) || '' }}
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE_REPO }}@${{ needs.check.outputs.base_digest }}

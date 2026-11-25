@@ -1,7 +1,11 @@
+# syntax=docker/dockerfile:1
+
 # Usage:
 #   docker run --cap-add CAP_SYS_MODULE -v /lib/modules:/lib/modules:ro wadey/synology-tun
 
-FROM alpine:3
+ARG BASE_IMAGE=alpine:3
+
+FROM ${BASE_IMAGE}
 
 RUN apk add --no-cache kmod
 
