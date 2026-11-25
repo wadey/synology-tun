@@ -14,8 +14,8 @@ on:
 
 env:
   IMAGE_NAME: wadey/synology-tun
-  BASE_IMAGE_REPO: docker.io/library/alpine
-  BASE_IMAGE_TAG: "3"
+  BASE_IMAGE_REPO: docker.io/library/busybox
+  BASE_IMAGE_TAG: latest
 
 jobs:
   check:
@@ -87,9 +87,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
